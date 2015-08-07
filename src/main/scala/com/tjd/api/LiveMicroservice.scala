@@ -1,56 +1,62 @@
 package com.tjd.api
 
-import scala.concurrent.{ ExecutionContext, Future, Await, Promise }
-import scala.concurrent.duration._
-import akka.actor.{ Actor, ActorSystem, ActorRef }
-import akka.event.{ Logging, LoggingAdapter }
-import akka.util.{ ByteString, Timeout }
-import akka.stream.{ ActorMaterializer }
-import akka.stream.scaladsl.{ Tcp, Source, Sink, Flow, RunnableGraph, FlowGraph, Broadcast, Zip }
-import akka.stream.io.OutputStreamSink
-import akka.stream.stage.{ StatefulStage, StageState, Context, SyncDirective }
+import scala.concurrent.ExecutionContext
+import scala.concurrent.Future
+import scala.concurrent.duration.DurationInt
+import scala.language.postfixOps
+
+import com.tjd.video.CamActor
+import com.typesafe.config.Config
+import com.typesafe.config.ConfigFactory
+
+import akka.actor.ActorSystem
+import akka.actor.Props
+import akka.event.Logging
+import akka.event.LoggingAdapter
+import akka.event.Logging.InfoLevel
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
-import spray.json._
 import akka.http.scaladsl.marshallers.xml.ScalaXmlSupport
-import com.typesafe.config.{ Config, ConfigFactory }
-import java.util.UUID
-import java.net.InetSocketAddress
-import java.io.{ PipedInputStream, PipedOutputStream }
-import com.tjd.video.Transcoder
+import akka.http.scaladsl.marshalling.ToResponseMarshallable.apply
+import akka.http.scaladsl.server.Directives._
+import akka.http.scaladsl.server.RouteResult.route2HandlerFlow
+import akka.http.scaladsl.server.directives.LoggingMagnet.forRequestResponseFromMarker
+import akka.pattern.ask
+import akka.stream.ActorMaterializer
+import akka.stream.io.OutputStreamSink
+import akka.stream.scaladsl.Broadcast
+import akka.stream.scaladsl.Flow
+import akka.stream.scaladsl.FlowGraph
+import akka.util.ByteString
+import akka.util.Timeout
+import spray.json.DefaultJsonProtocol
+
+case class Person(id: String, firstName: String, lastName: String, short: String, email: String)
+case class CamStreamMeta(name: String, description: String, thumb: String)
+case class Uplink(protocol: String, address: String, port: Int)
+case class CamStream(id: String, synopsis: CamStreamMeta, producer: Person, uplink: Uplink)
 
 trait Protocols extends DefaultJsonProtocol with SprayJsonSupport with ScalaXmlSupport {
-
-  implicit object UuidJsonFormat extends RootJsonFormat[UUID] {
-    def write(x: UUID) = JsString(x.toString)
-
-    def read(value: JsValue) = value match {
-      case JsString(x) => UUID.fromString(x)
-      case x           => deserializationError("Expected UUID as JsString, but got " + x)
-    }
-  }
-
-  case class Person(id: UUID, firstName: String, lastName: String, short: String, email: String)
   implicit val personFormat = jsonFormat5(Person)
-
-  case class CamStreamMeta(name: String, description: String, thumb: String)
   implicit val camMetaFormat = jsonFormat3(CamStreamMeta)
-
-  case class Uplink(protocol: String, address: String, port: Int)
   implicit val uplinkFormat = jsonFormat3(Uplink)
-
-  case class CamStream(id: UUID, synopsis: CamStreamMeta, producer: Person, uplink: Uplink)
   implicit val camFormat = jsonFormat4(CamStream)
 }
 
 trait Service extends Protocols {
   implicit val system: ActorSystem
   implicit val executor: ExecutionContext
-  implicit val log: LoggingAdapter
+  val log: LoggingAdapter
   implicit val materializer: ActorMaterializer
   implicit val config: Config
   implicit val interface: String
+
+  import scala.concurrent.duration._
+  import scala.language.postfixOps
+  implicit val timeout = Timeout(2 minutes)
+
+  //  val people: TableQuery[People]
+  //  val db: Database
 
   val routes = pathPrefix("cams") {
     get {
@@ -75,7 +81,7 @@ trait Service extends Protocols {
         entity(as[CamStreamMeta]) {
           request =>
             handleWith {
-              startTranscoder
+              newCamActor
             }
         }
       }
@@ -83,6 +89,10 @@ trait Service extends Protocols {
     pathPrefix("media") {
       getFromBrowseableDirectory(config.getString("live.contentRoot"))
     }
+
+  def newCamActor(request: CamStreamMeta) = Future {
+    (system.actorOf(Props[CamActor]) ? request).mapTo[CamStream]
+  }
 
   def redirectToStream(out: java.io.OutputStream) = Flow() { implicit b =>
     import FlowGraph.Implicits._
@@ -99,40 +109,6 @@ trait Service extends Protocols {
     // expose ports
     (broadcast.in, zero.outlet)
   }
-
-  def startTranscoder(request: CamStreamMeta) = {
-    val id = UUID.randomUUID();
-    val source = Tcp().bind(config.getString("live.interface"), 0)
-    val shutdownPromise = Promise[Tcp.ServerBinding]
-
-    val handleTcpConnection = Flow[Tcp.IncomingConnection].map {
-      conn =>
-        val in = new java.io.PipedInputStream
-        val out = new java.io.PipedOutputStream(in)
-        conn.handleWith(redirectToStream(out))
-
-        shutdownPromise.future.map { shutdown =>
-          val xcoder = Transcoder(s"${config.getString("live.contentRoot")}$id", in)
-          log.info("Transcoder for new cam {} exited with value:{}", id, xcoder.run)
-          shutdown.unbind()
-          log.info("Unbound cam {} from port {}", id, shutdown.localAddress.getPort)
-        }
-
-    }
-
-    val bindingFuture = source.via(handleTcpConnection).to(Sink.ignore).run
-    bindingFuture.map { binding =>
-      log.info("Listening on tcp://{}:{}", binding.localAddress.getHostName, binding.localAddress.getPort)
-      shutdownPromise.success(binding)
-
-      CamStream(
-        id,
-        request,
-        Person(id, "Jaime", "Meritt", "jmeritt", "jaime.meritt@gmail.com"),
-        Uplink("tcp", binding.localAddress.getHostName, binding.localAddress.getPort))
-    }
-  }
-
 }
 
 object LiveMicroservice extends App with Service {
@@ -148,7 +124,11 @@ object LiveMicroservice extends App with Service {
   val port = liveConfig.getInt("httpPort")
 
   log.info(s"Starting server on http://$interface:$port")
-  Http().bindAndHandle(handler = logRequestResult("log")(routes),
+  Http().bindAndHandle(handler = logRequestResult("log", InfoLevel)(routes),
     interface = interface,
     port = port)
+    
+   scala.io.StdIn.readLine()
+   system.shutdown()
+    
 }

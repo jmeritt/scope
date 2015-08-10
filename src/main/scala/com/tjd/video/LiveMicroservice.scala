@@ -1,4 +1,4 @@
-package com.tjd.api
+package com.tjd.video
 
 import akka.actor.ActorRef
 import scala.concurrent.ExecutionContext
@@ -6,7 +6,7 @@ import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
 import scala.language.postfixOps
 
-import com.tjd.video.CamActor
+
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 
@@ -36,26 +36,12 @@ import spray.json.DefaultJsonProtocol
 
 import java.util.UUID
 
-package object Messages {
-  case class Person(id: String, firstName: String, lastName: String, short: String, email: String)
-  case class CamStreamMeta(name: String, description: String, thumb: String)
-  case class Uplink(protocol: String, address: String, port: Int)
-  case class CamStream(id: String, synopsis: CamStreamMeta, producer: Person, uplink: Uplink)
-
-  case class Enter(person: Person, actor: ActorRef)
-  case class Leave(person: Person)
-  case class Shout(person: Person, message: String)
-  case class Contribute(person: Person, amount: Int)
-  case class ContributeAnnounce(contrib: Contribute, total: Int)
-}
-
 trait Protocols extends DefaultJsonProtocol with SprayJsonSupport with ScalaXmlSupport {
-  import Messages._
-  implicit val personFormat = jsonFormat5(Person)
-  implicit val camMetaFormat = jsonFormat3(CamStreamMeta)
-  implicit val uplinkFormat = jsonFormat3(Uplink)
-  implicit val camFormat = jsonFormat4(CamStream)
-  implicit val shoutFormat = jsonFormat2(Shout)
+  implicit val personFormat = jsonFormat5(Messages.Person)
+  implicit val camMetaFormat = jsonFormat3(Messages.CamStreamMeta)
+  implicit val uplinkFormat = jsonFormat3(Messages.Uplink)
+  implicit val camFormat = jsonFormat4(Messages.CamStream)
+  implicit val shoutFormat = jsonFormat2(Messages.Shout)
 }
 
 trait Service extends Protocols {
@@ -110,23 +96,24 @@ trait Service extends Protocols {
     import FlowGraph.Implicits._
 
     // prepare graph elements
-    val broadcast = b.add(Broadcast[Message](2))
-    val jsonator = BidiFlow[Message, Messages.Shout, Messages.Shout, Message](outbound = { msg: Message =>
+    val jsonator = b.add(BidiFlow[Message, Messages.Shout, Messages.Shout, Message](outbound = { msg: Message =>
       Messages.Shout(Messages.Person("JAIME", "JAIME", "JAIME", "JAIME", "JAIME"), "WASSSUP")
     },
       inbound = { shout: Messages.Shout =>
         TextMessage.Strict("WASSSSSUP")
-      })
-
-    val sink = b.add(Sink.ignore)
-    val zero = b.add(Flow[Message].filter { _ => false })
-
-    // connect the graph
-    broadcast.out(0) ~> sink
-    broadcast.out(1) ~> zero.inlet
+      }))
+      
+      def camActor = system.actorOf(Props[CamActor])
+      def personActor = system.actorOf(Props[PersonActor])
+      val source = Source.actorRef(8, akka.stream.OverflowStrategy.dropHead)
+      val sink = Sink.actorRef(camActor, 1)
+      
+                jsonator.out1 ~> sink
+      source ~> jsonator.in2
+    
 
     // expose ports
-    (broadcast.in, zero.outlet)
+    (jsonator.in1, jsonator.out2)
   }
 
   import Messages._
